@@ -454,8 +454,18 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
         }
     }
 
+    if (token_count > 0) {
+        double sum_sq = 0.0;
+        for (int i = 0; i < (int)token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+        fprintf(stderr, "DENSE ATTN_OUT NORM layer=%d %.6f\n", layer, sum_sq);
+    }
     quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->o_proj.shape[1]);
     matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->o_proj, token_count);
+    if (token_count > 0) {
+        double sum_sq = 0.0;
+        for (int i = 0; i < (int)token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+        fprintf(stderr, "DENSE AFTER_O_PROJ NORM layer=%d %.6f\n", layer, sum_sq);
+    }
 }
 
 void forward(Model *model, InferenceState *state, const int *tokens, size_t token_count, int start_pos) {
@@ -481,6 +491,11 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
         rmsnorm(state->hidden, state->residual, &weights->input_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
         attention(state, model->weights.layers, layer, start_pos, token_count, scores);
         rmsnorm(state->hidden, state->hidden, &weights->post_attn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
+        if (token_count > 0) {
+            double sum_sq = 0.0;
+            for (int i = 0; i < (int)token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+            fprintf(stderr, "DENSE POST_ATTN NORM layer=%d %.6f\n", layer, sum_sq);
+        }
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE, 1.0f);
 
         rmsnorm(state->hidden, state->residual, &weights->pre_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
@@ -503,6 +518,9 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
                    ((float *)weights->layer_scalar.data)[0]);
     }
     }
+    float hidden_norm = 0.0f;
+    for (int d = 0; d < HIDDEN_SIZE; d++) hidden_norm += state->residual[d] * state->residual[d];
+    fprintf(stderr, "FINAL HIDDEN NORM: %f\n", hidden_norm);
 }
 
 // Reuses the embedding matrix to turn the final token representation into vocabulary logits, then applies Gemma's tanh soft cap.
@@ -514,6 +532,14 @@ float *logits(Model *model, InferenceState *state, size_t token) {
         matmul_int8(state->hidden, state->quantized, state->activation_scales, &model->weights.embed, 1);
         #pragma omp for schedule(static)
         for (int i = 0; i < VOCAB_SIZE; i++) state->hidden[i] = 30.0f * tanhf(state->hidden[i] / 30.0f);
+        if (token == 0) {
+            float max_logit = -1e30f;
+            int max_id = 0;
+            for (int i = 0; i < VOCAB_SIZE; i++) {
+                if (state->hidden[i] > max_logit) { max_logit = state->hidden[i]; max_id = i; }
+            }
+            fprintf(stderr, "TOP LOGIT DENSE: token=%d logit=%f\n", max_id, max_logit);
+        }
     }
     return state->hidden;
 }
@@ -598,6 +624,13 @@ void generate(Model *model, InferenceState *state, const char *prompt,
     if (end > MAX_CONTEXT || end < prompt_tokens) end = MAX_CONTEXT;
     for (int position = prompt_tokens; position < end; position++) {
         int next_token = sample(logits(model, state, position == prompt_tokens ? (prompt_tokens - 1) % BATCH_SIZE : 0), VOCAB_SIZE, temperature);
+        if (position == prompt_tokens) {
+            float *logits_out = logits(model, state, position == prompt_tokens ? (prompt_tokens - 1) % BATCH_SIZE : 0);
+            int best = 0;
+            for (int i = 1; i < VOCAB_SIZE; i++) if (logits_out[i] > logits_out[best]) best = i;
+            fprintf(stderr, "TOP LOGIT: token=%d text=%s logit=%f\n", best, token_text(&model->tokenizer, best), logits_out[best]);
+        }
+        fprintf(stderr, "GEN TOKEN pos=%d token=%d text=%s\n", position, next_token, token_text(&model->tokenizer, next_token));
         if (next_token == 1 || next_token == 106) break; // Stop at <eos> or <turn|>.
 
         fputs(token_text(tokenizer, next_token), stdout);

@@ -494,7 +494,12 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
 
     // Allocate SSA scratch space once per attention call.
     size_t M = cache_len;
-    size_t scratch_needed = (size_t)M * 4 * sizeof(int) + (size_t)256 * 2 * sizeof(int) + (size_t)token_count * (SSA_MAX_CALL + SSA_K) * sizeof(int) + (size_t)token_count * SSA_K * sizeof(float) + (size_t)token_count * SSA_MAX_CALL * sizeof(uint8_t);
+    int first_key = full_attention ? 0 : (start_pos + 1 > SLIDING_WINDOW ? start_pos + 1 - SLIDING_WINDOW : 0);
+    int num_keys = full_attention ? (int)start_pos + (int)token_count : (int)start_pos + (int)token_count - first_key;
+    if (num_keys > (int)M) num_keys = (int)M;
+    M = (size_t)num_keys;
+    const int Kall = (2 * SSA_WINDOW + 1) + SSA_GLOBAL + SSA_MAX_CALL;
+    size_t scratch_needed = (size_t)M * 4 * sizeof(int) + (size_t)256 * 2 * sizeof(int) + (size_t)token_count * (2 * Kall) * sizeof(int) + (size_t)token_count * (2 * Kall) * sizeof(uint8_t) + (size_t)token_count * SSA_K * sizeof(float);
     if (!state->ssa_scratch || state->ssa_scratch_size < scratch_needed) {
         state->ssa_scratch_size = scratch_needed;
         state->ssa_scratch = realloc(state->ssa_scratch, scratch_needed);
@@ -506,9 +511,9 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
     int *bstart = sorted_k + M;
     int *bsize = bstart + 256;
     int *all_cand = bsize + 256;
-    uint8_t *all_valid = (uint8_t *)(all_cand + (size_t)token_count * SSA_MAX_CALL);
-    int *neighbors = (int *)(all_valid + (size_t)token_count * SSA_MAX_CALL);
-    uint8_t *valid = (uint8_t *)(neighbors + (size_t)token_count * SSA_K);
+    uint8_t *all_valid = (uint8_t *)(all_cand + (size_t)token_count * Kall);
+    int *neighbors = (int *)(all_valid + (size_t)token_count * Kall);
+    uint8_t *valid = (uint8_t *)(neighbors + (size_t)token_count * Kall);
     float *scores_buf = (float *)(valid + (size_t)token_count * SSA_K);
 
     for (size_t head = 0; head < num_heads; head++) {
@@ -543,7 +548,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
 
         for (int r = 0; r < R; r++) {
             for (size_t m = 0; m < M; m++) {
-                const float *kv = key_cache + m * head_dim;
+                const float *kv = key_cache + (first_key + m) * head_dim;
                 int id = 0;
                 for (int p = 0; p < p_eff; p++) {
                     float dot = 0.0f;
@@ -602,7 +607,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
                 if (bid < 0 || bid >= num_buckets) bid = 0;
                 int start = bstart[bid];
                 int bsz = bsize[bid];
-                int base = (int)n * Call + r * lsh_candidates;
+                int base = (int)n * Kall + r * lsh_candidates;
                 for (int c = 0; c < lsh_candidates; c++) {
                     int valid_c = (c < bsz);
                     int cand_pos = valid_c ? (start + c) : (int)M;
@@ -620,7 +625,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
 
         // Cross-round dedup
         for (size_t n = 0; n < token_count; n++) {
-            int base = (int)n * Call;
+            int base = (int)n * Kall;
             int total = call_used;
             if (total <= 0) total = 1;
             for (int i = 0; i < total - 1; i++) {
@@ -655,7 +660,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
             if (total <= 0) total = 1;
             int actual_k = K < total ? K : total;
             for (size_t n = 0; n < token_count; n++) {
-                int base_cand = (int)n * total;
+                int base_cand = (int)n * Kall;
                 const float *qv = queries + n * q_stride + head * head_dim;
                 for (int c = 0; c < total; c++) {
                     int ki = all_cand[base_cand + c];
@@ -704,9 +709,8 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
             }
         }
 
-        // Merge window + global + LSH + self
+        // Merge window + global + LSH
         {
-            int Kall = (2 * window + 1) + G + call_used;
             int *combined = neighbors;
             uint8_t *combined_valid = valid;
 
@@ -717,7 +721,6 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
                     int pos = (int)(start_pos + n + off);
                     if (pos < 0) pos = 0;
                     if (pos >= (int)M) pos = (int)M - 1;
-                    if (causal && pos > (int)(start_pos + n)) pos = (int)(start_pos + n);
                     combined[base + slot] = pos;
                     combined_valid[base + slot] = 1;
                     slot++;
@@ -727,28 +730,24 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
                     combined_valid[base + slot] = 1;
                     slot++;
                 }
-                int lsh_base = (int)n * call_used;
+                int lsh_base = (int)n * Kall;
                 for (int c = 0; c < call_used; c++) {
                     combined[base + slot + c] = all_cand[lsh_base + c];
                     combined_valid[base + slot + c] = all_valid[lsh_base + c];
                 }
                 slot += call_used;
-
                 int sentinel = (int)M;
-                for (int i = 0; i < Kall; i++) {
-                    if (combined_valid[base + i] && combined[base + i] == (int)(start_pos + n)) {
-                        combined[base + i] = sentinel;
-                        combined_valid[base + i] = 0;
-                    }
-                }
                 for (int i = 1; i < Kall; i++) {
                     int v = combined[base + i];
+                    uint8_t vv = combined_valid[base + i];
                     int j = i - 1;
                     while (j >= 0 && combined[base + j] > v) {
                         combined[base + j + 1] = combined[base + j];
+                        combined_valid[base + j + 1] = combined_valid[base + j];
                         j--;
                     }
                     combined[base + j + 1] = v;
+                    combined_valid[base + j + 1] = vv;
                 }
                 uint8_t *keep = (uint8_t *)scores_buf; // reuse scores_buf as temp
                 for (int i = 0; i < Kall; i++) {
@@ -821,7 +820,7 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
             if (sum > 0.0f) {
                 for (int k = 0; k < K; k++) attn_w[k] /= sum;
             }
-            for (int d = 0; d < head_dim; d++) out_ptr[d] = 0.0f;
+            // Note: heads are pre-cleared above
             for (int k = 0; k < K; k++) {
                 int ki = neighbors[base_nb + k];
                 if (!valid[base_nb + k] || ki < 0 || ki >= (int)M) continue;
@@ -832,11 +831,24 @@ void attention(InferenceState *state, const LayerWeights *layers, int layer,
         }
     }
 
+    if (start_pos == 0 && token_count == 10) {
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+        char dbuf[128]; int dlen = snprintf(dbuf, sizeof(dbuf), "ATTN_OUT NORM layer=%d %.6f\n", layer, sum_sq);
+        write(2, dbuf, dlen);
+    }
     quantize(state->quantized, state->activation_scales, state->hidden, token_count, weights->o_proj.shape[1]);
     matmul_int8(state->hidden, state->quantized, state->activation_scales, &weights->o_proj, token_count);
+    if (start_pos == 0 && token_count == 10) {
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+        char dbuf[128]; int dlen = snprintf(dbuf, sizeof(dbuf), "AFTER_O_PROJ NORM layer=%d %.6f\n", layer, sum_sq);
+        write(2, dbuf, dlen);
+    }
 }
 
 void forward(Model *model, InferenceState *state, const int *tokens, size_t token_count, int start_pos) {
+    { char dbuf[128]; int dlen = snprintf(dbuf, sizeof(dbuf), "FWD start_pos=%d token_count=%zu\n", start_pos, token_count); write(2, dbuf, dlen); }
     int per_layer_width = model->weights.per_layer_projection_norm.shape[0];
     // One OpenMP team stays alive for the full forward pass while each kernel divides its own loop.
     #pragma omp parallel num_threads(thread_count())
@@ -859,6 +871,12 @@ void forward(Model *model, InferenceState *state, const int *tokens, size_t toke
         rmsnorm(state->hidden, state->residual, &weights->input_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
         attention(state, model->weights.layers, layer, start_pos, token_count, scores);
         rmsnorm(state->hidden, state->hidden, &weights->post_attn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
+        if (start_pos == 0 && token_count == 10) {
+            double sum_sq = 0.0;
+            for (size_t i = 0; i < token_count * 4096; i++) sum_sq += state->hidden[i] * state->hidden[i];
+            char dbuf[128]; int dlen = snprintf(dbuf, sizeof(dbuf), "POST_ATTN NORM layer=%d %.6f\n", layer, sum_sq);
+            write(2, dbuf, dlen);
+        }
         add_and_scale(state->residual, state->hidden, token_count * HIDDEN_SIZE, 1.0f);
 
         rmsnorm(state->hidden, state->residual, &weights->pre_ffn_layernorm, HIDDEN_SIZE, 1e-6f, token_count);
@@ -893,6 +911,12 @@ float *logits(Model *model, InferenceState *state, size_t token) {
         #pragma omp for schedule(static)
         for (int i = 0; i < VOCAB_SIZE; i++) state->hidden[i] = 30.0f * tanhf(state->hidden[i] / 30.0f);
     }
+    int max_id = 0;
+    float max_val = state->hidden[0];
+    for (int i = 1; i < VOCAB_SIZE; i++) {
+        if (state->hidden[i] > max_val) { max_val = state->hidden[i]; max_id = i; }
+    }
+    { char dbuf[128]; int dlen = snprintf(dbuf, sizeof(dbuf), "TOP LOGIT SSA token=%zu id=%d val=%f\n", token, max_id, max_val); write(2, dbuf, dlen); }
     return state->hidden;
 }
 
@@ -1061,7 +1085,8 @@ int main(int argc, char **argv) {
         tensors[i].scales = tensors[i].scales ? (uint16_t *)((uint8_t *)model + (uintptr_t)tensors[i].scales) : NULL;
     }
     InferenceState *state = calloc(1, sizeof(*state));
-    state->ssa_scratch_size = (size_t)MAX_CONTEXT * 4 * sizeof(int) + (size_t)256 * 2 * sizeof(int) + (size_t)BATCH_SIZE * (SSA_MAX_CALL + SSA_K) * sizeof(int) + (size_t)BATCH_SIZE * SSA_K * sizeof(float) + (size_t)BATCH_SIZE * SSA_MAX_CALL * sizeof(uint8_t);
+    const int Kall_main = (2 * SSA_WINDOW + 1) + SSA_GLOBAL + SSA_MAX_CALL;
+    state->ssa_scratch_size = (size_t)MAX_CONTEXT * 4 * sizeof(int) + (size_t)256 * 2 * sizeof(int) + (size_t)BATCH_SIZE * (2 * Kall_main) * sizeof(int) + (size_t)BATCH_SIZE * (2 * Kall_main) * sizeof(uint8_t) + (size_t)BATCH_SIZE * SSA_K * sizeof(float);
     state->ssa_scratch = malloc(state->ssa_scratch_size);
     if (!state->ssa_scratch) { fprintf(stderr, "OOM ssa_scratch\n"); return 1; }
 
